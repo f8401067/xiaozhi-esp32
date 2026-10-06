@@ -805,6 +805,11 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
+        // The chat button should give an audible cue that listening has begun.
+        // The sound itself is played from StartListeningAudio(), because
+        // playing it here would be discarded by ResetDecoder in
+        // EnableVoiceProcessing().
+        play_popup_on_listening_ = true;
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -819,6 +824,20 @@ void Application::HandleToggleChatEvent() {
     }
 }
 
+bool Application::RetryOpenAudioChannel() {
+    // The server-issued token expires (30 days by default) while a device that
+    // stays powered on never re-runs the OTA flow, so it would keep failing
+    // until it is restarted. Refresh the websocket url/token through OTA and
+    // retry once; WebsocketProtocol::OpenAudioChannel() re-reads them from
+    // settings on every attempt, so a refreshed token is picked up here.
+    if (ota_->CheckVersion()) {
+        ESP_LOGI(TAG, "OTA config refreshed, retrying audio channel");
+    } else {
+        ESP_LOGW(TAG, "OTA config refresh failed, retrying with the existing config");
+    }
+    return protocol_->OpenAudioChannel();
+}
+
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
@@ -831,10 +850,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
-            // Return to idle so the device is not stuck in the connecting
-            // state (not every failure path reports a network error)
-            SetDeviceState(kDeviceStateIdle);
-            return;
+            // Refresh a possibly expired token through OTA and retry once.
+            if (!RetryOpenAudioChannel()) {
+                // Return to idle so the device is not stuck in the connecting
+                // state (not every failure path reports a network error)
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
         }
     }
 
@@ -967,11 +989,14 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
-            // Return to idle so the device is not stuck in the connecting
-            // state (not every failure path reports a network error), and
-            // wake word detection is re-enabled by the idle state handler.
-            SetDeviceState(kDeviceStateIdle);
-            return;
+            // Refresh a possibly expired token through OTA and retry once.
+            if (!RetryOpenAudioChannel()) {
+                // Return to idle so the device is not stuck in the connecting
+                // state (not every failure path reports a network error), and
+                // wake word detection is re-enabled by the idle state handler.
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
         }
     }
 
@@ -1009,12 +1034,13 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateIdle:
             // Keep a just-raised network error visible. SetDeviceState(idle)
             // queues STATE_CHANGED after Alert(), and the idle handler would
-            // otherwise wipe the status, emotion, and chat message.
+            // otherwise wipe the status and emotion.
             if (last_error_message_.empty()) {
                 display->SetStatus(Lang::Strings::STANDBY);
-                display->ClearChatMessages();  // Clear messages first
-                display->SetEmotion(
-                    "neutral");  // Then set emotion (wechat mode checks child count)
+                // The centre transcript is a persistent log: it is deliberately
+                // not cleared when a session ends or the network drops, so the
+                // conversation stays readable until the device is restarted.
+                display->SetEmotion("neutral");
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
@@ -1081,10 +1107,12 @@ void Application::StartListeningAudio() {
 
     ConfigureWakeWordForListening();
 
-    // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
+    // Play the listening cue after ResetDecoder (in EnableVoiceProcessing) has
+    // been called. This is the same sound as the boot "ready" cue, which reads
+    // more clearly than the short popup.
     if (play_popup_on_listening_) {
         play_popup_on_listening_ = false;
-        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     }
 }
 

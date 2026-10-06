@@ -45,11 +45,16 @@ protected:
     lv_obj_t* low_battery_popup_ = nullptr;
     lv_obj_t* low_battery_label_ = nullptr;
 
-    const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
+    std::string battery_indicator_;
     bool muted_ = false;
 
     std::chrono::system_clock::time_point last_status_update_time_;
+
+    // Text shown by the battery indicator. The default returns the Material
+    // Symbols icon glyph; a display may override it, for example to show a
+    // numeric percentage instead.
+    virtual std::string GetBatteryIndicatorText(int battery_level, bool charging);
     esp_timer_handle_t notification_timer_ = nullptr;
     int last_displayed_clock_min_ = -1;   // -1 forces update on first idle tick
     std::unique_ptr<DynamicGlyphCache> dynamic_glyph_cache_;

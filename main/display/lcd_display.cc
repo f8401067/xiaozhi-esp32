@@ -9,13 +9,19 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <material_symbols.h>
 #include <noto_emoji.h>
+#include <nvs_flash.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
+#include "audio_codec.h"
 #include "board.h"
 
 #define TAG "LcdDisplay"
@@ -24,40 +30,55 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_material_symbols_30_4);
 LV_FONT_DECLARE(font_noto_emoji_30_4);
+LV_FONT_DECLARE(font_fluent_icons_24_4);
+LV_FONT_DECLARE(font_fluent_wifi_26_4);
+LV_FONT_DECLARE(font_fluent_mute_20_4);
+// Noto Sans SC digit subsets for the always-on clock: 0-9 plus ':' and '-' for
+// the time, 0-9 plus '-' for the date. Both are sized so the digit ink comes
+// out at the intended height (46 px -> 34-36 px ink, 25 px -> 18 px ink).
+LV_FONT_DECLARE(font_clock_46_4);
+LV_FONT_DECLARE(font_date_25_4);
 
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
-    auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
-    auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
+    // Fluent UI System Icons (MIT), 24 px / 4 bpp, generated in
+    // main/display/font_fluent_icons_24_4.c. Its cmap also answers the
+    // Material codepoints the status bar already uses, so icon selection is
+    // untouched.
+    auto icon_font = std::make_shared<LvglBuiltInFont>(&font_fluent_icons_24_4);
+    auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_fluent_icons_24_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
-    // light theme
+    // This UI is dark-only. The pure black Fluent palette is registered under
+    // both theme names because Display::SetTheme() persists the active theme
+    // name in NVS and the server can also push a theme: a stored or selected
+    // "light" must not switch the device back to a white background.
     auto light_theme = new LvglTheme("light");
-    light_theme->set_background_color(lv_color_hex(0xFFFFFF));
-    light_theme->set_text_color(lv_color_hex(0x000000));
-    light_theme->set_chat_background_color(lv_color_hex(0xE0E0E0));
-    light_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
-    light_theme->set_assistant_bubble_color(lv_color_hex(0xDDDDDD));
-    light_theme->set_system_bubble_color(lv_color_hex(0xFFFFFF));
-    light_theme->set_system_text_color(lv_color_hex(0x000000));
-    light_theme->set_border_color(lv_color_hex(0x000000));
-    light_theme->set_low_battery_color(lv_color_hex(0x000000));
+    light_theme->set_background_color(lv_color_hex(0x000000));
+    light_theme->set_text_color(lv_color_hex(0xFFFFFF));
+    light_theme->set_chat_background_color(lv_color_hex(0x000000));
+    light_theme->set_user_bubble_color(lv_color_hex(0x0078D4));
+    light_theme->set_assistant_bubble_color(lv_color_hex(0x1A1A1A));
+    light_theme->set_system_bubble_color(lv_color_hex(0x000000));
+    light_theme->set_system_text_color(lv_color_hex(0xC5C5C5));
+    light_theme->set_border_color(lv_color_hex(0x2E2E2E));
+    light_theme->set_low_battery_color(lv_color_hex(0xC42B1C));
     light_theme->set_text_font(text_font);
     light_theme->set_icon_font(icon_font);
     light_theme->set_large_icon_font(large_icon_font);
     light_theme->set_emoji_font(emoji_font);
 
-    // dark theme
+    // dark theme - Windows 11 Fluent colours on a pure black background
     auto dark_theme = new LvglTheme("dark");
     dark_theme->set_background_color(lv_color_hex(0x000000));
     dark_theme->set_text_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_chat_background_color(lv_color_hex(0x1F1F1F));
-    dark_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
-    dark_theme->set_assistant_bubble_color(lv_color_hex(0x222222));
+    dark_theme->set_chat_background_color(lv_color_hex(0x000000));
+    dark_theme->set_user_bubble_color(lv_color_hex(0x0078D4));
+    dark_theme->set_assistant_bubble_color(lv_color_hex(0x1A1A1A));
     dark_theme->set_system_bubble_color(lv_color_hex(0x000000));
-    dark_theme->set_system_text_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_border_color(lv_color_hex(0xFFFFFF));
-    dark_theme->set_low_battery_color(lv_color_hex(0xFF0000));
+    dark_theme->set_system_text_color(lv_color_hex(0xC5C5C5));
+    dark_theme->set_border_color(lv_color_hex(0x2E2E2E));
+    dark_theme->set_low_battery_color(lv_color_hex(0xC42B1C));
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
@@ -79,7 +100,7 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
 
     // Load theme from settings
     Settings settings("display", false);
-    std::string theme_name = settings.GetString("theme", "light");
+    std::string theme_name = settings.GetString("theme", "dark");
     current_theme_ = LvglThemeManager::GetInstance().GetTheme(theme_name);
 
     // Create a timer to hide the preview image
@@ -851,6 +872,35 @@ void LcdDisplay::ClearChatMessages() {
     ESP_LOGI(TAG, "Chat messages cleared");
 }
 #else
+// Auto screen-off choices, cycled by the third settings row. 0 seconds means
+// the screen never turns itself off.
+constexpr int kAutoOffSeconds[] = {30, 60, 180, 0};
+constexpr const char* kAutoOffLabels[] = {"30秒", "1分", "3分", "常亮"};
+constexpr int kAutoOffCount = 4;
+
+// Backlight level of the always-on clock. Deliberately below the settings
+// brightness floor: it is not a reading level, just enough to see the time in
+// a dark room.
+constexpr int kAodBrightness = 3;
+// The clock sits above centre with the date under it. Both labels use digit
+// subsets whose glyph boxes equal their line boxes, so a centred label centres
+// the digits exactly and these offsets are the ink centres, measured from the
+// screen centre.
+constexpr int kAodTimeOffsetY = -22;
+constexpr int kAodDateOffsetY = 32;
+// Both lines use tabular digits, so their widths are fixed: the clock measures
+// 4 x 25.5 + 12.8 = 114.8 px and the date 8 x 13.875 + 2 x 8.6875 = 128.4 px.
+// The clock carries this much extra tracking so the two lines come out the same
+// width (5 x 3 = 15 px, landing within ~1 px either side of the date).
+constexpr int kAodTimeLetterSpace = 3;
+// The clock screen also carries the battery percentage, styled exactly like the
+// main page's: same font and colour, the same right-hand inset
+// (kStatusBarPaddingX in SetupUI) and the same vertical position, which is
+// where the top bar's own battery frame lands (measured on device as y=[8..38]
+// with the 31 px text font).
+constexpr int kAodBatteryInsetX = 16;
+constexpr int kAodBatteryTop = 8;
+
 void LcdDisplay::SetupUI() {
     // Prevent duplicate calls - if already called, return early
     if (setup_ui_called_) {
@@ -862,8 +912,6 @@ void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
-    auto icon_font = lvgl_theme->icon_font()->font();
-    auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
@@ -879,22 +927,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
 
-    /* Bottom layer: emoji_box_ - centered display */
-    emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(emoji_box_, 0, 0);
-    lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
-
-    emoji_label_ = lv_label_create(emoji_box_);
-    lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
-    lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
-
-    emoji_image_ = lv_img_create(emoji_box_);
-    lv_obj_center(emoji_image_);
-    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    /* The upstream centre emotion layer (emoji_box_ / emoji_label_ /
+       emoji_image_) is intentionally not created here: this layout uses the
+       centre for flowing text instead. SetEmotion() accepts and ignores
+       updates so server-driven emotions cannot re-create it. */
 
     /* Middle layer: preview_image_ - centered display */
     preview_image_ = lv_image_create(screen);
@@ -902,28 +938,41 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
-    /* Layer 1: Top bar - for status icons */
+    /* Layer 1: Top bar - Fluent status bar: flat, transparent, 1 px divider.
+       The horizontal padding keeps the icons clear of the rounded corners of
+       the screen's bezel. */
+    constexpr int kStatusBarHeight = 36;    // 24 px icon line box + 2 x 6 px padding
+    constexpr int kStatusBarPaddingX = 16;  // inset for the rounded-rectangle bezel
     top_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
+    lv_obj_set_size(top_bar_, LV_HOR_RES, kStatusBarHeight);
     lv_obj_set_style_radius(top_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background
-    lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(top_bar_, 0, 0);
     lv_obj_set_style_pad_all(top_bar_, 0, 0);
-    lv_obj_set_style_pad_top(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_left(top_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(top_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_left(top_bar_, kStatusBarPaddingX, 0);
+    lv_obj_set_style_pad_right(top_bar_, kStatusBarPaddingX, 0);
     lv_obj_set_flex_flow(top_bar_, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(top_bar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 0);
 
-    // Left icon
+    // Fluent divider separating the status bar from the content area.
+    lv_obj_t* status_separator = lv_obj_create(screen);
+    lv_obj_set_size(status_separator, LV_HOR_RES, 1);
+    lv_obj_set_style_radius(status_separator, 0, 0);
+    lv_obj_set_style_bg_opa(status_separator, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(status_separator, lvgl_theme->border_color(), 0);
+    lv_obj_set_style_border_width(status_separator, 0, 0);
+    lv_obj_set_style_pad_all(status_separator, 0, 0);
+    lv_obj_set_scrollbar_mode(status_separator, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(status_separator, LV_ALIGN_TOP_MID, 0, kStatusBarHeight);
+
+    // Left icon - the WiFi state indicator. It is drawn from its own copy of
+    // the icon glyphs (26 px) so it reads as the status bar's primary indicator.
     network_label_ = lv_label_create(top_bar_);
     lv_label_set_text(network_label_, "");
-    lv_obj_set_style_text_font(network_label_, icon_font, 0);
+    lv_obj_set_style_text_font(network_label_, &font_fluent_wifi_26_4, 0);
     lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
 
     // Right icons container
@@ -936,32 +985,89 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
+    // The mute indicator is drawn from the 20 px Fluent glyph copy, a step
+    // below the 26 px WiFi glyphs so the pair is visually balanced.
     mute_label_ = lv_label_create(right_icons);
     lv_label_set_text(mute_label_, "");
-    lv_obj_set_style_text_font(mute_label_, icon_font, 0);
+    lv_obj_set_style_text_font(mute_label_, &font_fluent_mute_20_4, 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
 
+    // The battery is reported as a percentage rather than an icon glyph, so
+    // this label follows the body text font (see
+    // LcdDisplay::GetBatteryIndicatorText). It must not use a size of its own:
+    // the asset loader swaps the theme's body font after SetupUI()
+    // (assets.cc -> SetTextFont), and a local font here would show a size
+    // change on every boot.
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
-    lv_obj_set_style_text_font(battery_label_, icon_font, 0);
+    lv_obj_set_style_text_font(battery_label_, text_font, 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(2), 0);
+    lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(3), 0);
 
-    /* Layer 2: Status bar - for center text labels */
+    // Each status-bar glyph comes from its own generated font, so each needs its
+    // own trim to land where this layout wants it.
+    constexpr int kWifiIconNudge = 2;  // WiFi: keeps the height set for the 26 px glyphs
+    lv_obj_set_style_translate_y(network_label_, kWifiIconNudge, 0);
+
+    // The mute glyph sits in the right icon row rather than the status bar
+    // itself, which starts a few pixels higher, so it needs its own trim to line
+    // up with the WiFi glyph on the left.
+    constexpr int kMuteIconNudge = 8;
+    lv_obj_set_style_translate_y(mute_label_, kMuteIconNudge, 0);
+
+    // The battery text is the tallest item in the right icon row, so it sits at
+    // that row's top edge; this trim lands its baseline where this UI wants it.
+    constexpr int kBatteryTextNudge = 11;
+    lv_obj_set_style_translate_y(battery_label_, kBatteryTextNudge, 0);
+
+    // Auto screen-off: one tick a second. Key presses (NotifyUserActivity), new
+    // transcript lines and notifications restart the countdown, and the third
+    // settings row picks the delay. While the clock is up, the tick keeps it
+    // current.
+    idle_timer_ = lv_timer_create(
+        [](lv_timer_t* timer) {
+            auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
+            if (!self->screen_on_) {
+                self->RefreshAod();
+                return;
+            }
+            int timeout = kAutoOffSeconds[self->auto_off_index_];
+            if (timeout == 0 || ++self->idle_seconds_ < timeout) {
+                return;
+            }
+            ESP_LOGI(TAG, "No activity for %d s, showing the clock", timeout);
+            self->SetScreenOn(false);
+        },
+        1000, this);
+
+    /* Layer 2: Bottom status bar - the clock and notifications share one
+       centred slot (Windows taskbar style). Keeping them out of the icon row
+       means that row only ever mixes the battery text with glyphs of one font,
+       so the two never disagree about vertical centring. */
+    constexpr int kBottomBarHeight = 32;
     status_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
+    lv_obj_set_size(status_bar_, LV_HOR_RES, kBottomBarHeight);
     lv_obj_set_style_radius(status_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(status_bar_, 0, 0);
     lv_obj_set_style_pad_all(status_bar_, 0, 0);
-    lv_obj_set_style_pad_top(status_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(status_bar_, lvgl_theme->spacing(2), 0);
     lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // Use absolute positioning
-    lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
+    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // absolute positioning
+    lv_obj_align(status_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Matching Fluent divider above the bottom status bar
+    lv_obj_t* bottom_separator = lv_obj_create(screen);
+    lv_obj_set_size(bottom_separator, LV_HOR_RES, 1);
+    lv_obj_set_style_radius(bottom_separator, 0, 0);
+    lv_obj_set_style_bg_opa(bottom_separator, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(bottom_separator, lvgl_theme->border_color(), 0);
+    lv_obj_set_style_border_width(bottom_separator, 0, 0);
+    lv_obj_set_style_pad_all(bottom_separator, 0, 0);
+    lv_obj_set_scrollbar_mode(bottom_separator, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(bottom_separator, LV_ALIGN_BOTTOM_MID, 0, -kBottomBarHeight);
 
     notification_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
+    lv_obj_set_width(notification_label_, LV_HOR_RES - 2 * kStatusBarPaddingX);
     lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(notification_label_, "");
@@ -969,7 +1075,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
     status_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
+    lv_obj_set_width(status_label_, LV_HOR_RES - 2 * kStatusBarPaddingX);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
@@ -1000,43 +1106,32 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
 #else
-    /* Top layer: Bottom bar - fixed height at bottom */
+    /* Centre transcript: a vertical log of message labels, top-aligned and
+       growing downward. One label per message keeps the RAM cost low (no
+       per-message container) while still allowing per-message alignment. */
+    constexpr int kContentMarginX = 16;  // aligned with the status bar padding
+    constexpr int kContentMarginY = 8;
     bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(8));
+    lv_obj_set_size(bottom_bar_, LV_HOR_RES - 2 * kContentMarginX,
+                    LV_VER_RES - kStatusBarHeight - 1 - kBottomBarHeight - 2 * kContentMarginY);
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
-    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
-    lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
-    lv_obj_set_style_pad_left(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(bottom_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
+    lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
+    lv_obj_set_style_pad_row(bottom_bar_, kContentMarginY, 0);
+    lv_obj_set_flex_flow(bottom_bar_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(bottom_bar_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
     lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
-
-    /* chat_message_label_ placed in bottom_bar_, single-line horizontal scroll */
-    chat_message_label_ = lv_label_create(bottom_bar_);
-    lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
-    lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
-
-    // Start scrolling after a delay (short text won't scroll)
-    static lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_delay(&a, 1000);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_obj_set_style_anim(chat_message_label_, &a, LV_PART_MAIN);
-    lv_obj_set_style_anim_duration(chat_message_label_, lv_anim_speed_clamped(60, 300, 60000),
-                                   LV_PART_MAIN);
+    lv_obj_align(bottom_bar_, LV_ALIGN_TOP_MID, 0, kStatusBarHeight + 1 + kContentMarginY);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
 #endif
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, text_font->line_height * 2);
-    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -lvgl_theme->spacing(4));
+    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0,
+                 -(kBottomBarHeight + lvgl_theme->spacing(2)));
     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
     lv_obj_set_style_radius(low_battery_popup_, lvgl_theme->spacing(4), 0);
 
@@ -1056,7 +1151,9 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
     if (image == nullptr) {
         esp_timer_stop(preview_timer_);
-        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        if (emoji_box_ != nullptr) {
+            lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
@@ -1073,15 +1170,22 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
     }
 
-    // Hide emoji_box_
+    // Hide the emotion layer if this UI still has one
     if (gif_controller_) {
         gif_controller_->Stop();
     }
-    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    if (emoji_box_ != nullptr) {
+        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     esp_timer_stop(preview_timer_);
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
+
+// Transcript entries kept in the centre log before the oldest is dropped.
+// UP/DOWN page through this log, so it has to hold more than one screenful;
+// each entry is one label, roughly 300-450 bytes of heap.
+constexpr int kMaxChatMessages = 24;
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
@@ -1089,58 +1193,536 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
                  role, content);
     }
     DisplayLockGuard lock(this);
-    if (chat_message_label_ == nullptr) {
-        if (setup_ui_called_) {
-            ESP_LOGW(TAG,
-                     "SetChatMessage('%s', '%s') failed: chat_message_label_ is nullptr (SetupUI() "
-                     "was called but label not created)",
-                     role, content);
-        }
+    if (bottom_bar_ == nullptr || content == nullptr || content[0] == '\0') {
         return;
     }
-    lv_anim_delete(chat_message_label_, nullptr);
-    lv_label_set_text(chat_message_label_, content);
-    // Show bottom_bar_ only when there is content (and subtitle is not globally hidden)
-    if (bottom_bar_ != nullptr) {
-        if (content == nullptr || content[0] == '\0') {
-            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else if (!hide_subtitle_) {
-            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+
+    // Drop the oldest entry once the log is full.
+    while (lv_obj_get_child_cnt(bottom_bar_) >= (uint32_t)kMaxChatMessages) {
+        lv_obj_t* oldest = lv_obj_get_child(bottom_bar_, 0);
+        if (oldest == nullptr) {
+            break;
         }
+        lv_obj_del(oldest);
     }
-#if CONFIG_USE_MULTILINE_CHAT_MESSAGE
-    // Re-align bottom_bar_ after text change so it stays anchored to the bottom
-    // as its height adapts to the wrapped content.
-    if (bottom_bar_ != nullptr) {
-        lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    // The user's own words are right-aligned, everything the device says is
+    // left-aligned. The font is inherited from the screen style.
+    bool is_user = strcmp(role, "user") == 0;
+
+    lv_obj_t* message = lv_label_create(bottom_bar_);
+    lv_label_set_text(message, content);
+    lv_obj_set_width(message, LV_PCT(100));
+    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(message, is_user ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(
+        message, is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color(), 0);
+    // Remember the role so a theme change can re-apply the colour.
+    lv_obj_set_user_data(message, (void*)(is_user ? "user" : "assistant"));
+
+    if (!hide_subtitle_) {
+        lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
     }
-#endif
+    // A new line is something to look at, so it wakes the panel, or at least
+    // restarts the auto-off countdown when the panel is already on.
+    if (!screen_on_) {
+        SetScreenOn(true);
+    } else {
+        ResetIdleTimer();
+    }
+    // Keep the view where it is while the user is reading back through the log,
+    // otherwise every reply would yank them to the newest line.
+    if (!chat_reviewing_) {
+        lv_obj_scroll_to_view(message, LV_ANIM_OFF);
+    }
 }
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
-    // In non-wechat mode, just clear the chat message label and hide the bar
-    if (chat_message_label_ != nullptr) {
-        lv_label_set_text(chat_message_label_, "");
-    }
+    // In non-wechat mode the transcript is a plain log, so drop every entry
     if (bottom_bar_ != nullptr) {
+        lv_obj_clean(bottom_bar_);
         lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
     }
+    chat_reviewing_ = false;
+}
+
+void LcdDisplay::ScrollChat(int direction) {
+    DisplayLockGuard lock(this);
+    if (bottom_bar_ == nullptr || direction == 0) {
+        return;
+    }
+    // One page is the visible height less a row of margin, so a line is never
+    // cut in half across two presses.
+    lv_coord_t page = lv_obj_get_height(bottom_bar_) - 16;
+    if (page < 16) {
+        return;
+    }
+    // Hard boundaries: nothing above the oldest entry and nothing below the
+    // newest. scroll_top/bottom are negative when the content is shorter than
+    // the viewport, so this also keeps an empty transcript still instead of
+    // letting it bounce into the empty area.
+    lv_coord_t remaining = direction < 0 ? lv_obj_get_scroll_top(bottom_bar_)
+                                         : lv_obj_get_scroll_bottom(bottom_bar_);
+    if (remaining <= 0) {
+        return;
+    }
+    lv_coord_t step = page > remaining ? remaining : page;
+    // Scroll synchronously: an animated scroll only moves the object on the
+    // next animation frame, so the boundary checks and the review flag above
+    // would be reading a stale position. It also avoids animating (and
+    // repainting) a whole page on this single-core part.
+    lv_obj_scroll_by(bottom_bar_, 0, direction < 0 ? step : -step, LV_ANIM_OFF);
+    chat_reviewing_ = direction < 0 ? true : (step < remaining);
 }
 #endif
+
+// ============================================================================
+// Settings overlay and screen on/off, driven by the three function keys.
+//
+// Brightness and volume already persist themselves (Backlight uses
+// Settings("display")/"brightness", AudioCodec uses Settings("audio")/
+// "output_volume"), so adjusting them here is enough to survive a reboot.
+// ============================================================================
+
+constexpr int kSettingsRows = 4;  // keep in sync with settings_rows_ in the header
+constexpr int kSettingsBrightness = 0;
+constexpr int kSettingsVolume = 1;
+constexpr int kSettingsAutoOff = 2;
+constexpr int kSettingsReset = 3;
+constexpr int kSettingsStep = 10;           // change per key press
+constexpr int kSettingsMinBrightness = 10;  // never leave the panel unreadable
+// Mirrors the main page's top and bottom bars so both screens share one style.
+constexpr int kSettingsBarHeight = 36;
+constexpr int kSettingsBottomBarHeight = 32;
+constexpr int kSettingsRowMarginX = 16;  // side inset of the selection frames
+constexpr int kSettingsTitleNudge = 6;   // optical trim, see the title creation
+// The frame wraps the label's whole line box, and the body font's deep
+// descender leaves the glyphs sitting high inside it, so the text is trimmed
+// down to make the frame read centred on the characters.
+constexpr int kSettingsRowTextNudge = 3;
+
+// True once the reset row has been opened and is waiting for a confirming
+// press. "adjusting" is reused as the armed flag because the row holds no value
+// to adjust; moving the selection or pressing a direction key disarms it.
+bool LcdDisplay::SettingsResetArmed() const {
+    return settings_adjusting_ && settings_index_ == kSettingsReset;
+}
+
+void LcdDisplay::RefreshSettingsRows() {
+    static const char* kNames[kSettingsRows] = {"亮度", "音量", "自动息屏", "重置配网"};
+
+    for (int i = 0; i < kSettingsRows; i++) {
+        if (settings_rows_[i] == nullptr || settings_row_labels_[i] == nullptr) {
+            continue;
+        }
+        if (i == kSettingsBrightness) {
+            lv_label_set_text_fmt(settings_row_labels_[i], "%s %d%%", kNames[i], brightness_pct_);
+        } else if (i == kSettingsVolume) {
+            lv_label_set_text_fmt(settings_row_labels_[i], "%s %d%%", kNames[i], volume_pct_);
+        } else if (i == kSettingsAutoOff) {
+            lv_label_set_text_fmt(settings_row_labels_[i], "%s %s", kNames[i],
+                                  kAutoOffLabels[auto_off_index_]);
+        } else {
+            lv_label_set_text(settings_row_labels_[i], kNames[i]);
+        }
+    }
+
+    if (settings_hint_ != nullptr) {
+        // The reset row has no value; the frame colour and this hint are what
+        // tell the user the next OK press will actually wipe the device.
+        if (SettingsResetArmed()) {
+            lv_label_set_text(settings_hint_, "再按确定重置");
+        } else {
+            lv_label_set_text(settings_hint_,
+                              settings_adjusting_ ? "上下调值 确定返回" : "长按确定键退出");
+        }
+    }
+    RefreshSettingsSelection();
+}
+
+// Selection is drawn as a frame around the row: grey while browsing the list,
+// blue once the row has been opened for adjustment.
+void LcdDisplay::RefreshSettingsSelection() {
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+
+    for (int i = 0; i < kSettingsRows; i++) {
+        if (settings_rows_[i] == nullptr) {
+            continue;
+        }
+        bool selected = (i == settings_index_);
+        lv_obj_set_style_border_opa(settings_rows_[i], selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(settings_rows_[i],
+                                      settings_adjusting_ ? lvgl_theme->user_bubble_color()
+                                                          : lvgl_theme->system_text_color(),
+                                      0);
+    }
+}
+
+void LcdDisplay::OpenSettings() {
+    DisplayLockGuard lock(this);
+    if (container_ == nullptr) {
+        return;  // SetupUI() has not run yet
+    }
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+
+    if (settings_ == nullptr) {
+        // Plain container: the bar, the divider and the centred list are placed
+        // explicitly so the bar stays pinned to the top.
+        settings_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(settings_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_align(settings_, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_radius(settings_, 0, 0);
+        lv_obj_set_style_border_width(settings_, 0, 0);
+        lv_obj_set_style_pad_all(settings_, 0, 0);
+        lv_obj_set_style_bg_color(settings_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(settings_, LV_OPA_COVER, 0);
+        lv_obj_set_scrollbar_mode(settings_, LV_SCROLLBAR_MODE_OFF);
+
+        // Status bar, same height and divider colour as the main page.
+        lv_obj_t* bar = lv_obj_create(settings_);
+        lv_obj_set_size(bar, LV_HOR_RES, kSettingsBarHeight);
+        lv_obj_set_style_radius(bar, 0, 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bar, 0, 0);
+        lv_obj_set_style_pad_all(bar, 0, 0);
+        lv_obj_set_scrollbar_mode(bar, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
+
+        lv_obj_t* title = lv_label_create(bar);
+        lv_label_set_text(title, "设置");
+        lv_obj_set_style_text_color(title, lvgl_theme->text_color(), 0);
+        // The body font has a deep descender, so a centred label reads high in
+        // the bar; trim it down until it looks centred.
+        lv_obj_set_style_translate_y(title, kSettingsTitleNudge, 0);
+        lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+
+        lv_obj_t* divider = lv_obj_create(settings_);
+        lv_obj_set_size(divider, LV_HOR_RES, 1);
+        lv_obj_set_style_radius(divider, 0, 0);
+        lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(divider, lvgl_theme->border_color(), 0);
+        lv_obj_set_style_border_width(divider, 0, 0);
+        lv_obj_set_style_pad_all(divider, 0, 0);
+        lv_obj_set_scrollbar_mode(divider, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(divider, LV_ALIGN_TOP_MID, 0, kSettingsBarHeight);
+
+        // The rows are centred in what is left between the two bars.
+        lv_obj_t* list = lv_obj_create(settings_);
+        lv_obj_set_size(list, LV_HOR_RES,
+                        LV_VER_RES - kSettingsBarHeight - 1 - kSettingsBottomBarHeight - 1);
+        lv_obj_align(list, LV_ALIGN_TOP_MID, 0, kSettingsBarHeight + 1);
+        lv_obj_set_style_radius(list, 0, 0);
+        lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(list, 0, 0);
+        lv_obj_set_style_pad_all(list, 0, 0);
+        lv_obj_set_style_pad_row(list, 14, 0);
+        lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        // Each row is a frame that can light up as the selection marker; the
+        // border is always 2 px so selecting a row never shifts the layout.
+        for (int i = 0; i < kSettingsRows; i++) {
+            lv_obj_t* row = lv_obj_create(list);
+            lv_obj_set_size(row, LV_HOR_RES - 2 * kSettingsRowMarginX, LV_SIZE_CONTENT);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 2, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_hor(row, 12, 0);
+            lv_obj_set_style_pad_ver(row, 6, 0);
+            lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            settings_rows_[i] = row;
+
+            settings_row_labels_[i] = lv_label_create(row);
+            lv_label_set_text(settings_row_labels_[i], "");
+            lv_obj_set_style_text_color(settings_row_labels_[i], lvgl_theme->text_color(), 0);
+            lv_obj_set_style_translate_y(settings_row_labels_[i], kSettingsRowTextNudge, 0);
+        }
+
+        // Bottom bar, same height as the main page's, carries the key hint.
+        lv_obj_t* bottom_divider = lv_obj_create(settings_);
+        lv_obj_set_size(bottom_divider, LV_HOR_RES, 1);
+        lv_obj_set_style_radius(bottom_divider, 0, 0);
+        lv_obj_set_style_bg_opa(bottom_divider, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(bottom_divider, lvgl_theme->border_color(), 0);
+        lv_obj_set_style_border_width(bottom_divider, 0, 0);
+        lv_obj_set_style_pad_all(bottom_divider, 0, 0);
+        lv_obj_set_scrollbar_mode(bottom_divider, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(bottom_divider, LV_ALIGN_BOTTOM_MID, 0, -kSettingsBottomBarHeight);
+
+        lv_obj_t* bottom = lv_obj_create(settings_);
+        lv_obj_set_size(bottom, LV_HOR_RES, kSettingsBottomBarHeight);
+        lv_obj_set_style_radius(bottom, 0, 0);
+        lv_obj_set_style_bg_opa(bottom, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bottom, 0, 0);
+        lv_obj_set_style_pad_all(bottom, 0, 0);
+        lv_obj_set_scrollbar_mode(bottom, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(bottom, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+        settings_hint_ = lv_label_create(bottom);
+        lv_label_set_text(settings_hint_, "");
+        lv_obj_set_style_text_color(settings_hint_, lvgl_theme->system_text_color(), 0);
+        lv_obj_align(settings_hint_, LV_ALIGN_CENTER, 0, 0);
+    }
+
+    // Start from what the device is actually doing.
+    auto* backlight = Board::GetInstance().GetBacklight();
+    brightness_pct_ = Settings("display", false).GetInt(
+        "brightness", backlight != nullptr ? backlight->brightness() : 75);
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        volume_pct_ = codec->output_volume();
+    }
+    auto_off_index_ =
+        std::clamp(static_cast<int>(Settings("display", false).GetInt("auto_off", 0)), 0,
+                   kAutoOffCount - 1);
+
+    settings_index_ = 0;
+    settings_adjusting_ = false;
+    settings_open_ = true;
+    RefreshSettingsRows();
+    lv_obj_move_foreground(settings_);
+    lv_obj_remove_flag(settings_, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "Settings opened: brightness=%d volume=%d", brightness_pct_, volume_pct_);
+}
+
+void LcdDisplay::CloseSettings() {
+    DisplayLockGuard lock(this);
+    settings_open_ = false;
+    settings_adjusting_ = false;
+    if (settings_ != nullptr) {
+        lv_obj_add_flag(settings_, LV_OBJ_FLAG_HIDDEN);
+    }
+    ESP_LOGI(TAG, "Settings closed");
+}
+
+void LcdDisplay::SettingsMove(int delta) {
+    DisplayLockGuard lock(this);
+    if (!settings_open_ || delta == 0) {
+        return;
+    }
+
+    if (settings_adjusting_ && settings_index_ != kSettingsReset) {
+        // UP arrives as -1 and DOWN as +1 (list order), but on a level scale
+        // pressing up must give more, so the step is inverted here.
+        const int step = -delta * kSettingsStep;
+        if (settings_index_ == kSettingsBrightness) {
+            brightness_pct_ =
+                std::clamp(brightness_pct_ + step, kSettingsMinBrightness, 100);
+            auto* backlight = Board::GetInstance().GetBacklight();
+            if (backlight != nullptr) {
+                backlight->SetBrightness(brightness_pct_, true);  // permanent: writes NVS
+            }
+        } else if (settings_index_ == kSettingsVolume) {
+            volume_pct_ = std::clamp(volume_pct_ + step, 0, 100);
+            auto* codec = Board::GetInstance().GetAudioCodec();
+            if (codec != nullptr) {
+                codec->SetOutputVolume(volume_pct_);  // also writes NVS
+            }
+        } else if (settings_index_ == kSettingsAutoOff) {
+            // Only four choices, so wrap around instead of clamping: pressing
+            // down once more past 常亮 returns to 30秒.
+            const int dir = step > 0 ? 1 : -1;
+            auto_off_index_ = (auto_off_index_ + dir + kAutoOffCount) % kAutoOffCount;
+            Settings("display", true).SetInt("auto_off", auto_off_index_);
+            ResetIdleTimer();
+        }
+    } else {
+        // Browsing the list, or sitting on the reset row, which has no value to
+        // adjust. Moving the selection also cancels an armed reset, so the wipe
+        // can only ever be one deliberate OK press away from being armed.
+        settings_adjusting_ = false;
+        settings_index_ = std::clamp(settings_index_ + delta, 0, kSettingsRows - 1);
+    }
+    RefreshSettingsRows();
+}
+
+// Wipes every namespace that holds user state, keeping only "board" (the
+// per-unit UUID that identifies this device on the server) and "assets" (the
+// resource cache the firmware ships with anyway). Once the Wi-Fi credentials
+// are gone the next boot finds no network and falls through to the config
+// portal, so "reset" and "re-enter provisioning" are the same action.
+static void EraseUserSettingsAndRestart() {
+    static const char* kUserNamespaces[] = {"wifi", "display", "audio", "websocket", "mqtt"};
+
+    for (const char* ns : kUserNamespaces) {
+        nvs_handle_t handle;
+        if (nvs_open(ns, NVS_READWRITE, &handle) != ESP_OK) {
+            continue;
+        }
+        esp_err_t ret = nvs_erase_all(handle);
+        if (ret == ESP_OK) {
+            ret = nvs_commit(handle);
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to erase NVS namespace %s: %s", ns, esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "Erased NVS namespace %s", ns);
+        }
+        nvs_close(handle);
+    }
+
+    ESP_LOGI(TAG, "User settings cleared, restarting into Wi-Fi config mode");
+    esp_restart();
+}
+
+void LcdDisplay::SettingsConfirm() {
+    {
+        DisplayLockGuard lock(this);
+        if (!settings_open_) {
+            return;
+        }
+
+        if (!SettingsResetArmed()) {
+            settings_adjusting_ = !settings_adjusting_;
+            ResetIdleTimer();
+            RefreshSettingsRows();
+            return;
+        }
+
+        // Second press on the reset row. Warn first, then leave the LVGL lock
+        // free for a moment so the panel can actually paint the warning before
+        // the reboot takes it away.
+        lv_label_set_text(settings_hint_, "正在重置，即将重启");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(900));
+    EraseUserSettingsAndRestart();
+}
+
+// "Off" now means the always-on clock: the panel stays lit at the lowest level
+// and shows the time and date, so a glance does not need a key press. Any key
+// press (or a new message) brings the normal UI back.
+void LcdDisplay::SetScreenOn(bool on) {
+    DisplayLockGuard lock(this);
+    if (screen_on_ == on) {
+        return;
+    }
+    screen_on_ = on;
+    ResetIdleTimer();
+
+    if (!on) {
+        // A pending reset must not survive the screen going dark: the next key
+        // press only wakes the panel, so the press after that would otherwise
+        // wipe the device by surprise.
+        settings_adjusting_ = false;
+        if (settings_open_) {
+            RefreshSettingsRows();
+        }
+    }
+
+    auto* backlight = Board::GetInstance().GetBacklight();
+    if (backlight == nullptr) {
+        return;
+    }
+    if (on) {
+        if (aod_ != nullptr) {
+            lv_obj_add_flag(aod_, LV_OBJ_FLAG_HIDDEN);
+        }
+        backlight->RestoreBrightness();  // reloads the stored brightness
+    } else {
+        RefreshAod();
+        lv_obj_remove_flag(aod_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(aod_);
+        // Dim without touching the stored value, so waking up restores exactly
+        // the level the user chose.
+        backlight->SetBrightness(kAodBrightness);
+    }
+    ESP_LOGI(TAG, "Screen %s", on ? "on" : "off (clock)");
+}
+
+void LcdDisplay::RefreshAod() {
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+
+    if (aod_ == nullptr) {
+        aod_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(aod_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_set_style_bg_color(aod_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(aod_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(aod_, 0, 0);
+        lv_obj_set_style_radius(aod_, 0, 0);
+        lv_obj_set_style_pad_all(aod_, 0, 0);
+        lv_obj_set_scrollbar_mode(aod_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_add_flag(aod_, LV_OBJ_FLAG_HIDDEN);
+
+        aod_time_ = lv_label_create(aod_);
+        lv_obj_set_style_text_color(aod_time_, lvgl_theme->text_color(), 0);
+        // Digits only, so the big subset above covers the whole clock. Its
+        // glyph box equals the line box, so a centred label centres the digits.
+        lv_obj_set_style_text_font(aod_time_, &font_clock_46_4, 0);
+        // Tracking that makes the clock line exactly as wide as the date line.
+        lv_obj_set_style_text_letter_space(aod_time_, kAodTimeLetterSpace, 0);
+        lv_obj_align(aod_time_, LV_ALIGN_CENTER, 0, kAodTimeOffsetY);
+
+        aod_date_ = lv_label_create(aod_);
+        lv_obj_set_style_text_color(aod_date_, lvgl_theme->system_text_color(), 0);
+        lv_obj_set_style_text_font(aod_date_, &font_date_25_4, 0);
+        lv_obj_align(aod_date_, LV_ALIGN_CENTER, 0, kAodDateOffsetY);
+
+        // Mirrors the top bar's battery percentage so both screens read the
+        // same, in the same place.
+        aod_battery_ = lv_label_create(aod_);
+        lv_obj_set_style_text_font(aod_battery_, lvgl_theme->text_font()->font(), 0);
+        lv_obj_set_style_text_color(aod_battery_, lvgl_theme->text_color(), 0);
+        lv_obj_align(aod_battery_, LV_ALIGN_TOP_RIGHT, -kAodBatteryInsetX, kAodBatteryTop);
+    }
+
+    int battery_level;
+    bool charging, discharging;
+    if (Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging)) {
+        auto indicator = GetBatteryIndicatorText(battery_level, charging);
+        lv_label_set_text(aod_battery_, indicator.c_str());
+    }
+
+    time_t now = time(NULL);
+    struct tm* tm_now = localtime(&now);
+    if (tm_now->tm_year < 2025 - 1900) {
+        // No RTC on this board and the time has not arrived yet.
+        lv_label_set_text(aod_time_, "--:--");
+        lv_label_set_text(aod_date_, "");
+        return;
+    }
+    char buf[20];
+    strftime(buf, sizeof(buf), "%H:%M", tm_now);
+    lv_label_set_text(aod_time_, buf);
+    // Digits and dashes only, so the clock needs no CJK glyphs.
+    strftime(buf, sizeof(buf), "%Y-%m-%d", tm_now);
+    lv_label_set_text(aod_date_, buf);
+}
+
+void LcdDisplay::NotifyUserActivity() {
+    DisplayLockGuard lock(this);
+    ResetIdleTimer();
+}
+
+void LcdDisplay::ShowNotification(const char* notification, int duration_ms) {
+    LvglDisplay::ShowNotification(notification, duration_ms);
+    // A notification is something the user should look at, so it wakes the
+    // screen. SetStatus is deliberately not hooked the same way: the bottom-bar
+    // clock calls it every minute and would keep the screen awake forever.
+    if (!screen_on_) {
+        SetScreenOn(true);
+    } else {
+        NotifyUserActivity();
+    }
+}
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
+    // This UI does not create the centre emotion layer (see SetupUI), so
+    // emotion updates are accepted and ignored rather than logging a failure
+    // on every server-driven emotion change.
     if (emoji_image_ == nullptr) {
-        if (setup_ui_called_) {
-            ESP_LOGW(TAG,
-                     "SetEmotion('%s') failed: emoji_image_ is nullptr (SetupUI() was called but "
-                     "emoji image not created)",
-                     emotion);
-        }
         return;
     }
 
@@ -1217,6 +1799,13 @@ void LcdDisplay::SetEmotion(const char* emotion) {
 #endif
 }
 
+std::string LcdDisplay::GetBatteryIndicatorText(int battery_level, bool charging) {
+    // The Passport has no charge-detect path, so charging is always false; show
+    // the state-of-charge as a percentage to keep the status bar text-only.
+    (void)charging;
+    return std::to_string(battery_level) + "%";
+}
+
 void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
 
@@ -1227,18 +1816,17 @@ void LcdDisplay::SetTheme(Theme* theme) {
 
     // Set font
     auto text_font = lvgl_theme->text_font()->font();
-    auto icon_font = lvgl_theme->icon_font()->font();
-    auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
-    if (text_font->line_height >= 40) {
-        lv_obj_set_style_text_font(mute_label_, large_icon_font, 0);
-        lv_obj_set_style_text_font(battery_label_, large_icon_font, 0);
-        lv_obj_set_style_text_font(network_label_, large_icon_font, 0);
-    } else {
-        lv_obj_set_style_text_font(mute_label_, icon_font, 0);
-        lv_obj_set_style_text_font(battery_label_, icon_font, 0);
-        lv_obj_set_style_text_font(network_label_, icon_font, 0);
-    }
+    // The mute and WiFi indicators always use their own copies of the icon
+    // glyphs. These must not be gated on the body font: the asset loader can
+    // swap the theme's text font at runtime (assets.cc -> SetTextFont ->
+    // SetTheme), and any size test would silently fall through and put the
+    // status bar back on the theme icon font.
+    lv_obj_set_style_text_font(mute_label_, &font_fluent_mute_20_4, 0);
+    lv_obj_set_style_text_font(network_label_, &font_fluent_wifi_26_4, 0);
+    // The battery indicator is a percentage on this UI: it follows the body font
+    // so it never changes size when the theme's font is swapped in.
+    lv_obj_set_style_text_font(battery_label_, text_font, 0);
 
     // Set parent text color
     lv_obj_set_style_text_font(screen, text_font, 0);
@@ -1264,7 +1852,9 @@ void LcdDisplay::SetTheme(Theme* theme) {
     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+    if (emoji_label_ != nullptr) {
+        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+    }
 
     // If we have the chat message style, update all message bubbles
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
@@ -1338,19 +1928,25 @@ void LcdDisplay::SetTheme(Theme* theme) {
         }
     }
 #else
-    // Simple UI mode - just update the main chat message
-    if (chat_message_label_ != nullptr) {
-        lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
+    // Simple UI mode - re-apply the per-role colours to the transcript log
+    if (bottom_bar_ != nullptr) {
+        uint32_t count = lv_obj_get_child_cnt(bottom_bar_);
+        for (uint32_t i = 0; i < count; i++) {
+            lv_obj_t* message = lv_obj_get_child(bottom_bar_, i);
+            const char* role = static_cast<const char*>(lv_obj_get_user_data(message));
+            bool is_user = role != nullptr && strcmp(role, "user") == 0;
+            lv_obj_set_style_text_color(
+                message, is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color(), 0);
+        }
     }
 
     if (emoji_label_ != nullptr) {
         lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     }
 
-    // Update bottom bar background color with 50% opacity
+    // Keep the centre transcript transparent over the black background
     if (bottom_bar_ != nullptr) {
-        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);
-        lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
     }
 #endif
 
@@ -1369,13 +1965,9 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     if (bottom_bar_ != nullptr) {
         if (hide) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            // Only show if there is actual content to display
-            const char* text =
-                (chat_message_label_ != nullptr) ? lv_label_get_text(chat_message_label_) : nullptr;
-            if (text != nullptr && text[0] != '\0') {
-                lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-            }
+        } else if (lv_obj_get_child_cnt(bottom_bar_) > 0) {
+            // Only show if there is something in the transcript to display
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }

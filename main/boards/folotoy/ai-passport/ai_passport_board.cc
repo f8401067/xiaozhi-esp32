@@ -54,17 +54,69 @@ private:
         battery_->Initialize();
     }
 
-    void ChangeVolume(int delta) {
-        auto codec = GetAudioCodec();
-        auto volume = codec->output_volume() + delta;
-        if (volume > 100) {
-            volume = 100;
+    // Returns true when the key press was only consumed by waking the panel (or
+    // there is no display yet), so the caller must not also run the key's own
+    // action. The product specification documents "press a function button to
+    // wake" after the screen goes off.
+    bool KeyHandledByWake() {
+        if (display_ == nullptr) {
+            return true;
         }
-        if (volume < 0) {
-            volume = 0;
+        // Any key press is user activity: restart the auto screen-off countdown.
+        display_->NotifyUserActivity();
+        if (display_->IsScreenOn()) {
+            return false;
         }
-        codec->SetOutputVolume(volume);
-        GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+        display_->SetScreenOn(true);
+        return true;
+    }
+
+    // UP/DOWN page the transcript, and move/adjust inside the settings overlay.
+    void OnKeyUp() {
+        if (KeyHandledByWake()) {
+            return;
+        }
+        if (display_->IsSettingsOpen()) {
+            display_->SettingsMove(-1);
+        } else {
+            display_->ScrollChat(-1);
+        }
+    }
+
+    void OnKeyDown() {
+        if (KeyHandledByWake()) {
+            return;
+        }
+        if (display_->IsSettingsOpen()) {
+            display_->SettingsMove(1);
+        } else {
+            display_->ScrollChat(1);
+        }
+    }
+
+    // OK click still starts/stops a conversation (there is no wake word on this
+    // build, so it is the only way in) unless the settings overlay is open.
+    void OnKeyOk() {
+        if (KeyHandledByWake()) {
+            return;
+        }
+        if (display_->IsSettingsOpen()) {
+            display_->SettingsConfirm();
+        } else {
+            ToggleChat();
+        }
+    }
+
+    // OK held for 2 s opens the settings overlay, and closes it again.
+    void OnKeyOkLongPress() {
+        if (KeyHandledByWake()) {
+            return;
+        }
+        if (display_->IsSettingsOpen()) {
+            display_->CloseSettings();
+        } else {
+            display_->OpenSettings();
+        }
     }
 
     void ToggleChat() {
@@ -111,31 +163,27 @@ private:
 
         // Button callbacks run on the button task; schedule all UI/audio
         // work onto the main task so LVGL and codec access stay on one thread.
+        //
+        // Key map: UP/DOWN page the transcript (and move/adjust in settings),
+        // OK click starts or stops a conversation, OK held for 2 s opens the
+        // settings overlay. The former UP/DOWN volume shortcuts are gone so no
+        // gesture competes with the settings entry; volume now lives in there.
         auto up = adc_button_[kAdcButtonUp];
         up->OnClick([this]() {
-            Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
-        });
-        up->OnLongPress([this]() {
-            Application::GetInstance().Schedule([this]() {
-                GetAudioCodec()->SetOutputVolume(100);
-                GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
-            });
+            Application::GetInstance().Schedule([this]() { OnKeyUp(); });
         });
 
         auto down = adc_button_[kAdcButtonDown];
         down->OnClick([this]() {
-            Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
-        });
-        down->OnLongPress([this]() {
-            Application::GetInstance().Schedule([this]() {
-                GetAudioCodec()->SetOutputVolume(0);
-                GetDisplay()->ShowNotification(Lang::Strings::MUTED);
-            });
+            Application::GetInstance().Schedule([this]() { OnKeyDown(); });
         });
 
         auto ok = adc_button_[kAdcButtonOk];
         ok->OnClick([this]() {
-            Application::GetInstance().Schedule([this]() { ToggleChat(); });
+            Application::GetInstance().Schedule([this]() { OnKeyOk(); });
+        });
+        ok->OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() { OnKeyOkLongPress(); });
         });
     }
 

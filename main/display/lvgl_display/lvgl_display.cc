@@ -191,6 +191,26 @@ void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
     ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));
 }
 
+std::string LvglDisplay::GetBatteryIndicatorText(int battery_level, bool charging) {
+    if (charging) {
+        return MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT;
+    }
+    const char* levels[] = {
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_0,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_1,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_2,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_3,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_4,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_5,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_6,
+        MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL,
+    };
+    int level_index = battery_level <= 0
+                          ? 0
+                          : (battery_level >= 100 ? 7 : 1 + ((battery_level - 1) * 6 / 99));
+    return levels[level_index];
+}
+
 void LvglDisplay::UpdateStatusBar(bool update_all) {
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
@@ -235,39 +255,21 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
     }
 
     esp_pm_lock_acquire(pm_lock_);
-    // Update battery icon
+    // Update the battery indicator
     int battery_level;
     bool charging, discharging;
-    const char* icon = nullptr;
     if (board.GetBatteryLevel(battery_level, charging, discharging)) {
-        if (charging) {
-            icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT;
-        } else {
-            const char* levels[] = {
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_0,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_1,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_2,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_3,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_4,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_5,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_6,
-                MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL,
-            };
-            int level_index = battery_level <= 0
-                                  ? 0
-                                  : (battery_level >= 100 ? 7 : 1 + ((battery_level - 1) * 6 / 99));
-            icon = levels[level_index];
-        }
+        auto indicator = GetBatteryIndicatorText(battery_level, charging);
         DisplayLockGuard lock(this);
-        if (battery_label_ != nullptr && battery_icon_ != icon) {
-            battery_icon_ = icon;
-            lv_label_set_text(battery_label_, battery_icon_);
+        if (battery_label_ != nullptr && battery_indicator_ != indicator) {
+            battery_indicator_ = indicator;
+            lv_label_set_text(battery_label_, battery_indicator_.c_str());
         }
 
         // Check low battery popup only when clock tick event is triggered
         // Because when initializing, the battery level is not ready yet.
         if (low_battery_popup_ != nullptr && !update_all) {
-            if (strcmp(icon, MATERIAL_SYMBOLS_BATTERY_ANDROID_0) == 0 && discharging) {
+            if (battery_level <= 0 && !charging && discharging) {
                 if (lv_obj_has_flag(low_battery_popup_,
                                     LV_OBJ_FLAG_HIDDEN)) {  // Show if low battery popup is hidden
                     lv_obj_remove_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
@@ -294,7 +296,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         };
         if (std::find(allowed_states.begin(), allowed_states.end(), device_state) !=
             allowed_states.end()) {
-            icon = board.GetNetworkStateIcon();
+            const char* icon = board.GetNetworkStateIcon();
             if (network_label_ != nullptr && icon != nullptr && network_icon_ != icon) {
                 DisplayLockGuard lock(this);
                 network_icon_ = icon;

@@ -12,6 +12,28 @@
 
 #define TAG "WS"
 
+namespace {
+
+// The server reports failures that happen before the session is established
+// (for example an authentication rejection) as plain text instead of JSON.
+// Keep the original wording so it can be surfaced to the user, bounded so the
+// alert stays readable on the small screen.
+std::string ExtractPlainTextMessage(const std::string& text) {
+    constexpr size_t kMaxLength = 160;
+    const size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return std::string();
+    }
+    const size_t end = text.find_last_not_of(" \t\r\n");
+    std::string message = text.substr(begin, end - begin + 1);
+    if (message.size() > kMaxLength) {
+        message.resize(kMaxLength);
+    }
+    return message;
+}
+
+}  // namespace
+
 WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
 
 WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
@@ -140,6 +162,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
             }
         } else {
             // Parse JSON data
+            auto text = std::string(data, len);
             auto root = cJSON_ParseWithLength(data, len);
             auto type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type)) {
@@ -151,7 +174,15 @@ bool WebsocketProtocol::OpenAudioChannel() {
                     }
                 }
             } else {
-                ESP_LOGE(TAG, "Missing message type, data: %s", std::string(data, len).c_str());
+                // Non-JSON text, or JSON without a type. The server sends the
+                // reason as plain text (then closes) when it rejects the
+                // session, so show the original text and raise an error state
+                // instead of dropping it silently.
+                ESP_LOGE(TAG, "Missing message type, data: %s", text.c_str());
+                auto message = ExtractPlainTextMessage(text);
+                if (!message.empty()) {
+                    SetError(message);
+                }
             }
             cJSON_Delete(root);
         }
@@ -165,6 +196,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
         }
     });
 
+    ESP_LOGI(TAG, "Device-Id (WiFi STA MAC): %s", SystemInfo::GetMacAddress().c_str());
     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
     if (auto connected = websocket_->Connect(url.c_str()); !connected) {
         ESP_LOGE(TAG, "Failed to connect to websocket server: %s",

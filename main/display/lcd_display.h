@@ -33,6 +33,36 @@ protected:
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
+    // --- Function-key driven UI state ---------------------------------------
+    // The board owns the three ADC keys and forwards them here, so this class
+    // stays the only place that touches LVGL for key-driven UI.
+    lv_obj_t* settings_ = nullptr;             // overlay, built on first use
+    lv_obj_t* settings_rows_[4] = {};          // row frames: brightness/volume/off/reset
+    lv_obj_t* settings_row_labels_[4] = {};    // text inside those frames
+    lv_obj_t* settings_hint_ = nullptr;
+    int settings_index_ = 0;                   // highlighted row
+    bool settings_adjusting_ = false;          // adjusting the row's value
+    bool settings_open_ = false;
+    int brightness_pct_ = 0;                   // mirror of the NVS brightness
+    int volume_pct_ = 0;                       // mirror of the codec volume
+    bool chat_reviewing_ = false;              // transcript scrolled off the end
+    bool screen_on_ = true;
+
+    // --- Auto screen-off and the always-on clock ----------------------------
+    lv_obj_t* aod_ = nullptr;               // dim clock overlay, built on first use
+    lv_obj_t* aod_time_ = nullptr;
+    lv_obj_t* aod_date_ = nullptr;
+    lv_obj_t* aod_battery_ = nullptr;       // mirrors the top bar's percentage
+    lv_timer_t* idle_timer_ = nullptr;      // ticks once a second
+    int idle_seconds_ = 0;                  // seconds since the last user activity
+    int auto_off_index_ = 0;                // index into the auto-off delay table
+
+    void RefreshSettingsRows();
+    void RefreshSettingsSelection();
+    bool SettingsResetArmed() const;
+    void RefreshAod();                      // builds the clock on first use
+    void ResetIdleTimer() { idle_seconds_ = 0; }
+
     void InitializeLcdThemes();
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -54,6 +84,27 @@ public:
 
     // Set whether to hide chat messages/subtitles
     virtual void SetHideSubtitle(bool hide) override;
+
+    // This UI shows the battery as a percentage instead of an icon glyph.
+    virtual std::string GetBatteryIndicatorText(int battery_level, bool charging) override;
+
+    // --- Function-key driven UI (mapped by the board's buttons) -------------
+    // OK long press opens/closes the settings overlay; OK click keeps its chat
+    // duty unless the overlay is open; UP/DOWN page the transcript, or move and
+    // adjust inside the overlay.
+    void OpenSettings();
+    void CloseSettings();
+    bool IsSettingsOpen() const { return settings_open_; }
+    void SettingsMove(int delta);
+    void SettingsConfirm();
+    void ScrollChat(int direction);  // -1: one page older, +1: one page newer
+    void SetScreenOn(bool on);
+    bool IsScreenOn() const { return screen_on_; }
+    // Any key press counts as user activity and restarts the auto-off countdown.
+    void NotifyUserActivity();
+    // Keep the base's std::string overload visible alongside this override.
+    using LvglDisplay::ShowNotification;
+    virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
 };
 
 // SPI LCD display
