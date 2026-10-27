@@ -9,8 +9,12 @@
 
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <esp_idf_version.h>
+#include <inttypes.h>
+#include <soc/soc_caps.h>
 #include <esp_lcd_panel_vendor.h>
 #include <button_adc.h>
+#include <driver/gpio.h>
 #include <esp_adc/adc_oneshot.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
@@ -32,6 +36,8 @@ private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button* adc_button_[kAdcButtonNum];
     adc_oneshot_unit_handle_t adc_handle_ = nullptr;
+    esp_lcd_panel_io_handle_t display_io_ = nullptr;
+    esp_lcd_panel_handle_t display_panel_ = nullptr;
     LcdDisplay* display_;
     Cw2017BatteryMonitor* battery_;
 
@@ -278,10 +284,27 @@ private:
                                      DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
                                      DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        // Kept for EnterDeepSleep(): the panel needs DISPOFF + SLPIN before the
+        // rails are left to idle, otherwise its charge pump keeps drawing mA.
+        display_io_ = panel_io;
+        display_panel_ = panel;
     }
 
 public:
     AiPassportBoard() : display_(nullptr), battery_(nullptr) {
+        // A deep-sleep wakeup is a full chip reset, so this boot-time report is
+        // the only way to tell "the key woke it" from "it never woke up".
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+        uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
+        if (wakeup_causes != 0) {
+            ESP_LOGI(TAG, "Boot after sleep, wakeup causes: 0x%" PRIx32, wakeup_causes);
+        }
+#else
+        esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+        if (wakeup_cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+            ESP_LOGI(TAG, "Boot after sleep, wakeup cause: %d", static_cast<int>(wakeup_cause));
+        }
+#endif
         InitializeCodecI2c();
         InitializeSpi();
         InitializeDisplay();
@@ -346,11 +369,54 @@ void AiPassportBoard::EnterDeepSleep() {
         backlight->SetBrightness(0);
     }
 
+    // Put the panel itself to sleep. The backlight is already off, but the
+    // ST7789 controller keeps its charge pump and gate drivers running as long
+    // as it is awake - a few mA for the whole sleep, orders of magnitude more
+    // than the C3 itself (uA). SLPIN is what actually drops that current.
+    if (display_io_ != nullptr && display_panel_ != nullptr) {
+        esp_lcd_panel_disp_on_off(display_panel_, false);          // DISPOFF
+        esp_lcd_panel_io_tx_param(display_io_, 0x10, nullptr, 0);  // SLPIN
+        vTaskDelay(pdMS_TO_TICKS(10));                             // SLPIN needs 5 ms
+    }
+
+    // Gate the codec as well: a sleeping panel saves nothing if the ES8311 and
+    // the speaker amp stay powered. On this board the amp enable is not wired
+    // to the MCU (AUDIO_CODEC_PA_PIN is NC), so closing the codec device is the
+    // only knob available.
+    if (auto* codec = GetAudioCodec()) {
+        codec->EnableOutput(false);
+        codec->EnableInput(false);
+    }
+
+    // WiFi/BT need no explicit teardown: the deep-sleep power sequence cuts the
+    // radio domain. Calling esp_wifi_stop() here would only add a disconnect
+    // round-trip before the chip finally sleeps.
+
     // The three ADC ladder keys (UP/DOWN/OK) share GPIO0 through a resistor
-    // ladder; any press pulls GPIO0 low, so a low level wakes the chip.
-    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
-    ESP_ERROR_CHECK(gpio_wakeup_enable(GPIO_NUM_0, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    // ladder, so any press pulls GPIO0 low: UP ~0 mV, DOWN ~300 mV, OK
+    // ~595 mV, all below the 0.25 x VDD input-low threshold.
+    //
+    // gpio_wakeup_enable() + esp_sleep_enable_gpio_wakeup() only arm the *light*
+    // sleep GPIO path; esp_deep_sleep_start() ignores them, which left the chip
+    // with no wakeup source at all (a key press did nothing and only a reset or
+    // power cycle brought it back). Deep sleep needs the dedicated API.
+    constexpr gpio_num_t kKeyGpio = GPIO_NUM_0;
+    gpio_config_t key_config = {};
+    key_config.pin_bit_mask = 1ULL << kKeyGpio;
+    key_config.mode = GPIO_MODE_INPUT;
+    key_config.pull_up_en = GPIO_PULLUP_DISABLE;    // 10 kOhm pull-up is on the board
+    key_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    key_config.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&key_config));
+
+#if SOC_GPIO_SUPPORT_HP_PERIPH_PD_SLEEP_WAKEUP
+    // ESP32-C3 has no RTC-IO/ext1 wakeup path (SOC_PM_SUPPORT_EXT1_WAKEUP is
+    // unset); the deep-sleep GPIO wakeup is the only way in.
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(
+        1ULL << kKeyGpio, ESP_GPIO_WAKEUP_GPIO_LOW));
+#elif defined(SOC_PM_SUPPORT_EXT1_WAKEUP) && SOC_PM_SUPPORT_EXT1_WAKEUP
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(1ULL << kKeyGpio, ESP_EXT1_WAKEUP_ANY_LOW));
+#endif
     ESP_LOGI(TAG, "Entering deep sleep, wake on key (GPIO0 low)");
     esp_deep_sleep_start();
 }

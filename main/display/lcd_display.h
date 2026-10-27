@@ -37,8 +37,8 @@ protected:
     // The board owns the three ADC keys and forwards them here, so this class
     // stays the only place that touches LVGL for key-driven UI.
     lv_obj_t* settings_ = nullptr;             // overlay, built on first use
-    lv_obj_t* settings_rows_[4] = {};          // row frames: brightness/volume/off/reset
-    lv_obj_t* settings_row_labels_[4] = {};    // text inside those frames
+    lv_obj_t* settings_rows_[5] = {};          // row frames: brightness/volume/off/deep-sleep/reset
+    lv_obj_t* settings_row_labels_[5] = {};    // text inside those frames
     lv_obj_t* settings_hint_ = nullptr;
     int settings_index_ = 0;                   // highlighted row
     bool settings_adjusting_ = false;          // adjusting the row's value
@@ -57,6 +57,7 @@ protected:
     lv_timer_t* idle_timer_ = nullptr;      // ticks once a second
     int idle_seconds_ = 0;                  // seconds since the last user activity
     int auto_off_index_ = 2;                // index into the auto-off delay table (default 3 min)
+    int deep_sleep_index_ = 1;              // index into the deep-sleep delay table (default 10 min)
 
     void RefreshSettingsRows();
     void RefreshSettingsSelection();

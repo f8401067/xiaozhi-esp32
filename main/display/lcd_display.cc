@@ -878,7 +878,12 @@ void LcdDisplay::ClearChatMessages() {
 constexpr int kAutoOffSeconds[] = {30, 60, 180, 0};
 constexpr const char* kAutoOffLabels[] = {"30秒", "1分", "3分", "常亮"};
 constexpr int kAutoOffCount = 4;
-constexpr int kDeepSleepSeconds = 10 * 60;  // enter deep sleep this many seconds after the screen turns off
+// Deep-sleep delay after the screen goes off, cycled by the fourth settings row.
+// The board may refuse to sleep (audio still active); it then retries every tick.
+constexpr int kDeepSleepMinutes[] = {5, 10, 30, 60};
+constexpr const char* kDeepSleepLabels[] = {"5分", "10分", "30分", "60分"};
+constexpr int kDeepSleepCount = 4;
+constexpr int kDeepSleepDefaultIndex = 1;  // 10 minutes
 
 // Backlight level of the always-on clock. Deliberately below the settings
 // brightness floor: it is not a reading level, just enough to see the time in
@@ -1077,8 +1082,12 @@ void LcdDisplay::SetupUI() {
                 // Screen is off: keep counting toward deep sleep. Any key press
                 // calls SetScreenOn(true) and resets this counter via
                 // ResetIdleTimer(), so only a long idle drops to deep sleep.
-                if (++self->screen_off_seconds_ >= kDeepSleepSeconds) {
-                    self->screen_off_seconds_ = 0;
+                const int deep_sleep_seconds = kDeepSleepMinutes[self->deep_sleep_index_] * 60;
+                if (++self->screen_off_seconds_ >= deep_sleep_seconds) {
+                    // Board::EnterDeepSleep() bails out when audio is still
+                    // active. Keep the counter pinned at the threshold so the
+                    // next tick retries, instead of waiting the whole delay again.
+                    self->screen_off_seconds_ = deep_sleep_seconds;
                     Board::GetInstance().EnterDeepSleep();
                 }
                 return;
@@ -1422,11 +1431,12 @@ void LcdDisplay::ScrollChat(int direction) {
 // "output_volume"), so adjusting them here is enough to survive a reboot.
 // ============================================================================
 
-constexpr int kSettingsRows = 4;  // keep in sync with settings_rows_ in the header
+constexpr int kSettingsRows = 5;  // keep in sync with settings_rows_ in the header
 constexpr int kSettingsBrightness = 0;
 constexpr int kSettingsVolume = 1;
 constexpr int kSettingsAutoOff = 2;
-constexpr int kSettingsReset = 3;
+constexpr int kSettingsDeepSleep = 3;
+constexpr int kSettingsReset = 4;
 constexpr int kSettingsStep = 10;           // change per key press
 constexpr int kSettingsMinBrightness = 10;  // never leave the panel unreadable
 // The settings screen keeps the main page's bar height for its title row and
@@ -1450,7 +1460,7 @@ bool LcdDisplay::SettingsResetArmed() const {
 }
 
 void LcdDisplay::RefreshSettingsRows() {
-    static const char* kNames[kSettingsRows] = {"亮度", "音量", "自动息屏", "重置配网"};
+    static const char* kNames[kSettingsRows] = {"亮度", "音量", "自动息屏", "深睡", "重置配网"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         if (settings_rows_[i] == nullptr || settings_row_labels_[i] == nullptr) {
@@ -1463,6 +1473,9 @@ void LcdDisplay::RefreshSettingsRows() {
         } else if (i == kSettingsAutoOff) {
             lv_label_set_text_fmt(settings_row_labels_[i], "%s %s", kNames[i],
                                   kAutoOffLabels[auto_off_index_]);
+        } else if (i == kSettingsDeepSleep) {
+            lv_label_set_text_fmt(settings_row_labels_[i], "%s %s", kNames[i],
+                                  kDeepSleepLabels[deep_sleep_index_]);
         } else {
             lv_label_set_text(settings_row_labels_[i], kNames[i]);
         }
@@ -1556,7 +1569,11 @@ void LcdDisplay::OpenSettings() {
         lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(list, 0, 0);
         lv_obj_set_style_pad_all(list, 0, 0);
-        lv_obj_set_style_pad_row(list, 14, 0);
+        // Five rows now share the list, so both the gap (pad_row) and the row's
+        // own vertical padding are tighter than the four-row layout used. Without
+        // this the first and last selection frames spilled past the list area and
+        // were covered by the title bar and hint bar.
+        lv_obj_set_style_pad_row(list, 6, 0);
         lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
         lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
@@ -1572,7 +1589,7 @@ void LcdDisplay::OpenSettings() {
             lv_obj_set_style_border_width(row, 2, 0);
             lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
             lv_obj_set_style_pad_hor(row, 12, 0);
-            lv_obj_set_style_pad_ver(row, 6, 0);
+            lv_obj_set_style_pad_ver(row, 4, 0);
             lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
             lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
@@ -1623,6 +1640,9 @@ void LcdDisplay::OpenSettings() {
     auto_off_index_ =
         std::clamp(static_cast<int>(Settings("display", false).GetInt("auto_off", 2)), 0,
                    kAutoOffCount - 1);
+    deep_sleep_index_ = std::clamp(
+        static_cast<int>(Settings("display", false).GetInt("deep_sleep", kDeepSleepDefaultIndex)),
+        0, kDeepSleepCount - 1);
 
     settings_index_ = 0;
     settings_adjusting_ = false;
@@ -1672,6 +1692,11 @@ void LcdDisplay::SettingsMove(int delta) {
             const int dir = step > 0 ? 1 : -1;
             auto_off_index_ = (auto_off_index_ + dir + kAutoOffCount) % kAutoOffCount;
             Settings("display", true).SetInt("auto_off", auto_off_index_);
+            ResetIdleTimer();
+        } else if (settings_index_ == kSettingsDeepSleep) {
+            const int dir = step > 0 ? 1 : -1;
+            deep_sleep_index_ = (deep_sleep_index_ + dir + kDeepSleepCount) % kDeepSleepCount;
+            Settings("display", true).SetInt("deep_sleep", deep_sleep_index_);
             ResetIdleTimer();
         }
     } else {
