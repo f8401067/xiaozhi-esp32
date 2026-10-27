@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <string>
 #include <vector>
 
 #include "audio_codec.h"
@@ -877,6 +878,7 @@ void LcdDisplay::ClearChatMessages() {
 constexpr int kAutoOffSeconds[] = {30, 60, 180, 0};
 constexpr const char* kAutoOffLabels[] = {"30秒", "1分", "3分", "常亮"};
 constexpr int kAutoOffCount = 4;
+constexpr int kDeepSleepSeconds = 10 * 60;  // enter deep sleep this many seconds after the screen turns off
 
 // Backlight level of the always-on clock. Deliberately below the settings
 // brightness floor: it is not a reading level, just enough to see the time in
@@ -940,7 +942,9 @@ void LcdDisplay::SetupUI() {
 
     /* Layer 1: Top bar - Fluent status bar: flat, transparent, 1 px divider.
        The horizontal padding keeps the icons clear of the rounded corners of
-       the screen's bezel. */
+       the screen's bezel. This is the only bar on the screen: the state text
+       and the notifications that used to sit in a bottom bar now share this
+       row, so the transcript runs all the way to the bottom edge. */
     constexpr int kStatusBarHeight = 36;    // 24 px icon line box + 2 x 6 px padding
     constexpr int kStatusBarPaddingX = 16;  // inset for the rounded-rectangle bezel
     top_bar_ = lv_obj_create(screen);
@@ -975,6 +979,56 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(network_label_, &font_fluent_wifi_26_4, 0);
     lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
 
+    /* Centre slot: the device state and the transient notifications share one
+       label layer between the icons, exactly as they did in the bottom bar this
+       replaces. A flex-grow slot would centre the text between the two icon
+       clusters instead of on the panel, so the slot is taken out of the flex
+       flow and pinned to the panel's centre line; its width stops short of the
+       wider cluster (the battery percentage) on both sides, so the text can
+       never run under an icon. Anything longer scrolls inside it. */
+    constexpr int kStatusSlotClearance = 64;  // 16 px bar padding + the wider icon cluster
+    status_bar_ = lv_obj_create(top_bar_);
+    lv_obj_set_width(status_bar_, LV_HOR_RES - 2 * kStatusSlotClearance);
+    lv_obj_set_height(status_bar_, kStatusBarHeight);
+    lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_style_radius(status_bar_, 0, 0);
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_bar_, 0, 0);
+    lv_obj_set_style_pad_all(status_bar_, 0, 0);
+    lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // absolute positioning
+    lv_obj_align(status_bar_, LV_ALIGN_CENTER, 0, 0);
+
+    /* One optical trim for the whole bar. Every item is centred in the bar
+       first, then shifted by this amount together, so the WiFi glyph, the state
+       text, the mute glyph and the percentage cannot end up on different lines.
+       The old per-item trims (2 / 8 / 11) were tuned when this row held icons
+       only; they describe three different lines, which is exactly what shows up
+       once text joins them. 2 is the value the WiFi glyph already used, so the
+       left icon does not move. */
+    constexpr int kBarTrim = 2;
+    // Extra trim for the state text only, on top of kBarTrim.
+    constexpr int kStatusTextTrim = 0;
+
+    notification_label_ = lv_label_create(status_bar_);
+    lv_obj_set_width(notification_label_, LV_PCT(100));
+    lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+    lv_label_set_text(notification_label_, "");
+    lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_translate_y(notification_label_, kBarTrim + kStatusTextTrim, 0);
+    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+
+    status_label_ = lv_label_create(status_bar_);
+    lv_obj_set_width(status_label_, LV_PCT(100));
+    lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+    lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
+    lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_translate_y(status_label_, kBarTrim + kStatusTextTrim, 0);
+
     // Right icons container
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
     lv_obj_set_size(right_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -1004,21 +1058,13 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(3), 0);
 
-    // Each status-bar glyph comes from its own generated font, so each needs its
-    // own trim to land where this layout wants it.
-    constexpr int kWifiIconNudge = 2;  // WiFi: keeps the height set for the 26 px glyphs
-    lv_obj_set_style_translate_y(network_label_, kWifiIconNudge, 0);
-
-    // The mute glyph sits in the right icon row rather than the status bar
-    // itself, which starts a few pixels higher, so it needs its own trim to line
-    // up with the WiFi glyph on the left.
-    constexpr int kMuteIconNudge = 8;
-    lv_obj_set_style_translate_y(mute_label_, kMuteIconNudge, 0);
-
-    // The battery text is the tallest item in the right icon row, so it sits at
-    // that row's top edge; this trim lands its baseline where this UI wants it.
-    constexpr int kBatteryTextNudge = 11;
-    lv_obj_set_style_translate_y(battery_label_, kBatteryTextNudge, 0);
+    // Every item carries the bar's single trim (see kBarTrim). Each one is
+    // centred in the bar first - the two glyphs in their own row, the text in
+    // the centre slot - so one shared offset keeps them on one line instead of
+    // the three lines the old per-item trims produced.
+    lv_obj_set_style_translate_y(network_label_, kBarTrim, 0);
+    lv_obj_set_style_translate_y(mute_label_, kBarTrim, 0);
+    lv_obj_set_style_translate_y(battery_label_, kBarTrim, 0);
 
     // Auto screen-off: one tick a second. Key presses (NotifyUserActivity), new
     // transcript lines and notifications restart the countdown, and the third
@@ -1028,59 +1074,27 @@ void LcdDisplay::SetupUI() {
         [](lv_timer_t* timer) {
             auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(timer));
             if (!self->screen_on_) {
-                self->RefreshAod();
+                // Screen is off: keep counting toward deep sleep. Any key press
+                // calls SetScreenOn(true) and resets this counter via
+                // ResetIdleTimer(), so only a long idle drops to deep sleep.
+                if (++self->screen_off_seconds_ >= kDeepSleepSeconds) {
+                    self->screen_off_seconds_ = 0;
+                    Board::GetInstance().EnterDeepSleep();
+                }
                 return;
             }
             int timeout = kAutoOffSeconds[self->auto_off_index_];
             if (timeout == 0 || ++self->idle_seconds_ < timeout) {
                 return;
             }
-            ESP_LOGI(TAG, "No activity for %d s, showing the clock", timeout);
+            ESP_LOGI(TAG, "No activity for %d s, turning screen off", timeout);
             self->SetScreenOn(false);
         },
         1000, this);
 
-    /* Layer 2: Bottom status bar - the clock and notifications share one
-       centred slot (Windows taskbar style). Keeping them out of the icon row
-       means that row only ever mixes the battery text with glyphs of one font,
-       so the two never disagree about vertical centring. */
-    constexpr int kBottomBarHeight = 32;
-    status_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(status_bar_, LV_HOR_RES, kBottomBarHeight);
-    lv_obj_set_style_radius(status_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(status_bar_, 0, 0);
-    lv_obj_set_style_pad_all(status_bar_, 0, 0);
-    lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // absolute positioning
-    lv_obj_align(status_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
-
-    // Matching Fluent divider above the bottom status bar
-    lv_obj_t* bottom_separator = lv_obj_create(screen);
-    lv_obj_set_size(bottom_separator, LV_HOR_RES, 1);
-    lv_obj_set_style_radius(bottom_separator, 0, 0);
-    lv_obj_set_style_bg_opa(bottom_separator, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(bottom_separator, lvgl_theme->border_color(), 0);
-    lv_obj_set_style_border_width(bottom_separator, 0, 0);
-    lv_obj_set_style_pad_all(bottom_separator, 0, 0);
-    lv_obj_set_scrollbar_mode(bottom_separator, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(bottom_separator, LV_ALIGN_BOTTOM_MID, 0, -kBottomBarHeight);
-
-    notification_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(notification_label_, LV_HOR_RES - 2 * kStatusBarPaddingX);
-    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(notification_label_, "");
-    lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
-
-    status_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(status_label_, LV_HOR_RES - 2 * kStatusBarPaddingX);
-    lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
-    lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
+    /* There is no bottom bar any more: the state text and the notifications
+       live in the top bar's centre slot (see Layer 1), and the transcript
+       below simply runs to the bottom edge of the panel. */
 
 #if CONFIG_USE_MULTILINE_CHAT_MESSAGE
     /* Bottom bar - auto height, grows upward with wrapped text */
@@ -1108,17 +1122,18 @@ void LcdDisplay::SetupUI() {
 #else
     /* Centre transcript: a vertical log of message labels, top-aligned and
        growing downward. One label per message keeps the RAM cost low (no
-       per-message container) while still allowing per-message alignment. */
+       per-message container) while still allowing per-message alignment.
+       With no bottom bar the log owns everything down to the panel edge. */
     constexpr int kContentMarginX = 16;  // aligned with the status bar padding
     constexpr int kContentMarginY = 8;
     bottom_bar_ = lv_obj_create(screen);
     lv_obj_set_size(bottom_bar_, LV_HOR_RES - 2 * kContentMarginX,
-                    LV_VER_RES - kStatusBarHeight - 1 - kBottomBarHeight - 2 * kContentMarginY);
+                    LV_VER_RES - kStatusBarHeight - 1 - 2 * kContentMarginY);
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
     lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
     lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
-    lv_obj_set_style_pad_row(bottom_bar_, kContentMarginY, 0);
+    lv_obj_set_style_pad_row(bottom_bar_, 0, 0);  // message spacing handled by dividers
     lv_obj_set_flex_flow(bottom_bar_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(bottom_bar_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START);
@@ -1130,8 +1145,7 @@ void LcdDisplay::SetupUI() {
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, text_font->line_height * 2);
-    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0,
-                 -(kBottomBarHeight + lvgl_theme->spacing(2)));
+    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -lvgl_theme->spacing(4));
     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
     lv_obj_set_style_radius(low_battery_popup_, lvgl_theme->spacing(4), 0);
 
@@ -1187,6 +1201,45 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 // each entry is one label, roughly 300-450 bytes of heap.
 constexpr int kMaxChatMessages = 24;
 
+namespace {
+// Split a message into paragraphs on one or more blank lines. A single newline
+// inside a paragraph is kept as a normal wrapped-line break; only the blank
+// line between paragraphs is treated as a divider.
+std::vector<std::string> SplitMessageParagraphs(const char* content) {
+    std::vector<std::string> paragraphs;
+    std::string current;
+    const char* p = content;
+    while (*p != '\0') {
+        if (p[0] == '\n' && p[1] == '\n') {
+            // Blank line -> paragraph boundary; collapse any run of newlines.
+            while (!current.empty() &&
+                   (current.back() == '\r' || current.back() == ' ' || current.back() == '\t')) {
+                current.pop_back();
+            }
+            if (!current.empty()) {
+                paragraphs.push_back(current);
+                current.clear();
+            }
+            while (*p == '\n') {
+                ++p;
+            }
+        } else if (p[0] == '\r') {
+            ++p;  // normalise CRLF to LF
+        } else {
+            current += *p++;
+        }
+    }
+    while (!current.empty() &&
+           (current.back() == '\r' || current.back() == ' ' || current.back() == '\t')) {
+        current.pop_back();
+    }
+    if (!current.empty()) {
+        paragraphs.push_back(current);
+    }
+    return paragraphs;
+}
+}  // namespace
+
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
@@ -1197,27 +1250,110 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         return;
     }
 
-    // Drop the oldest entry once the log is full.
-    while (lv_obj_get_child_cnt(bottom_bar_) >= (uint32_t)kMaxChatMessages) {
+    // Count real messages (ignoring separator rules) and drop the oldest pair.
+    auto count_messages = [this]() {
+        uint32_t n = 0;
+        uint32_t c = lv_obj_get_child_cnt(bottom_bar_);
+        for (uint32_t i = 0; i < c; i++) {
+            const char* ud = static_cast<const char*>(
+                lv_obj_get_user_data(lv_obj_get_child(bottom_bar_, i)));
+            if (ud == nullptr || strcmp(ud, "divider") != 0) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    while (count_messages() >= (uint32_t)kMaxChatMessages) {
         lv_obj_t* oldest = lv_obj_get_child(bottom_bar_, 0);
         if (oldest == nullptr) {
             break;
         }
         lv_obj_del(oldest);
+        // The separator that followed the dropped message becomes the first row.
+        lv_obj_t* next = lv_obj_get_child(bottom_bar_, 0);
+        if (next != nullptr) {
+            const char* ud = static_cast<const char*>(lv_obj_get_user_data(next));
+            if (ud != nullptr && strcmp(ud, "divider") == 0) {
+                lv_obj_del(next);
+            }
+        }
     }
 
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     // The user's own words are right-aligned, everything the device says is
     // left-aligned. The font is inherited from the screen style.
     bool is_user = strcmp(role, "user") == 0;
+    lv_text_align_t text_align = is_user ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT;
+    lv_color_t text_color =
+        is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color();
 
-    lv_obj_t* message = lv_label_create(bottom_bar_);
-    lv_label_set_text(message, content);
-    lv_obj_set_width(message, LV_PCT(100));
-    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(message, is_user ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_color(
-        message, is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color(), 0);
+    // Split on blank lines so paragraphs can be separated by a thin green rule
+    // while keeping normal line spacing (a raw "\n\n" would leave a double gap).
+    std::vector<std::string> paragraphs = SplitMessageParagraphs(content);
+
+    // A thin green rule separates consecutive messages. With pad_row = 0 in the
+    // log, the spacing stays close to the normal line spacing instead of a gap.
+    if (lv_obj_get_child_cnt(bottom_bar_) > 0) {
+        lv_obj_t* divider = lv_obj_create(bottom_bar_);
+        lv_obj_set_width(divider, LV_PCT(100));
+        lv_obj_set_height(divider, 1);
+        lv_obj_set_style_bg_color(divider, lv_color_hex(0x00C853), 0);  // green
+        lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(divider, 0, 0);
+        lv_obj_set_style_radius(divider, 0, 0);
+        lv_obj_set_style_pad_all(divider, 0, 0);
+        lv_obj_set_style_margin_top(divider, 2, 0);
+        lv_obj_set_style_margin_bottom(divider, 2, 0);
+        lv_obj_set_user_data(divider, (void*)"divider");
+    }
+
+    lv_obj_t* message = nullptr;
+    if (paragraphs.size() <= 1) {
+        // Single paragraph: keep the cheap one-label path.
+        message = lv_label_create(bottom_bar_);
+        lv_label_set_text(message, content);
+        lv_obj_set_width(message, LV_PCT(100));
+        lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(message, text_align, 0);
+        lv_obj_set_style_text_color(message, text_color, 0);
+    } else {
+        // Multi-paragraph: a zero-gap column of paragraph labels with a thin
+        // green divider between consecutive paragraphs.
+        message = lv_obj_create(bottom_bar_);
+        lv_obj_set_width(message, LV_PCT(100));
+        lv_obj_set_height(message, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(message, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(message, 0, 0);
+        lv_obj_set_style_pad_all(message, 0, 0);
+        lv_obj_set_style_pad_row(message, 0, 0);  // no extra gap between paragraphs
+        lv_obj_set_flex_flow(message, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(message, LV_FLEX_ALIGN_START,
+                              is_user ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_START);
+
+        bool first = true;
+        for (const auto& paragraph : paragraphs) {
+            if (!first) {
+                lv_obj_t* divider = lv_obj_create(message);
+                lv_obj_set_width(divider, LV_PCT(100));
+                lv_obj_set_height(divider, 1);
+                lv_obj_set_style_bg_color(divider, lv_color_hex(0x00C853), 0);  // green
+                lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(divider, 0, 0);
+                lv_obj_set_style_radius(divider, 0, 0);
+                lv_obj_set_style_pad_all(divider, 0, 0);
+                lv_obj_set_style_margin_top(divider, 2, 0);
+                lv_obj_set_style_margin_bottom(divider, 2, 0);
+            }
+            lv_obj_t* para_label = lv_label_create(message);
+            lv_label_set_text(para_label, paragraph.c_str());
+            lv_obj_set_width(para_label, LV_PCT(100));
+            lv_label_set_long_mode(para_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(para_label, text_align, 0);
+            lv_obj_set_style_text_color(para_label, text_color, 0);
+            first = false;
+        }
+    }
     // Remember the role so a theme change can re-apply the colour.
     lv_obj_set_user_data(message, (void*)(is_user ? "user" : "assistant"));
 
@@ -1293,7 +1429,10 @@ constexpr int kSettingsAutoOff = 2;
 constexpr int kSettingsReset = 3;
 constexpr int kSettingsStep = 10;           // change per key press
 constexpr int kSettingsMinBrightness = 10;  // never leave the panel unreadable
-// Mirrors the main page's top and bottom bars so both screens share one style.
+// The settings screen keeps the main page's bar height for its title row and
+// adds a hint bar at the bottom of its own. The main page itself no longer has
+// a bottom bar - its state text sits in the top bar - but the overlay needs one
+// to keep the key hints out of the list.
 constexpr int kSettingsBarHeight = 36;
 constexpr int kSettingsBottomBarHeight = 32;
 constexpr int kSettingsRowMarginX = 16;  // side inset of the selection frames
@@ -1446,7 +1585,8 @@ void LcdDisplay::OpenSettings() {
             lv_obj_set_style_translate_y(settings_row_labels_[i], kSettingsRowTextNudge, 0);
         }
 
-        // Bottom bar, same height as the main page's, carries the key hint.
+        // Bottom bar, same height as the main page's top bar, carries the key
+        // hint. It belongs to this overlay only.
         lv_obj_t* bottom_divider = lv_obj_create(settings_);
         lv_obj_set_size(bottom_divider, LV_HOR_RES, 1);
         lv_obj_set_style_radius(bottom_divider, 0, 0);
@@ -1481,7 +1621,7 @@ void LcdDisplay::OpenSettings() {
         volume_pct_ = codec->output_volume();
     }
     auto_off_index_ =
-        std::clamp(static_cast<int>(Settings("display", false).GetInt("auto_off", 0)), 0,
+        std::clamp(static_cast<int>(Settings("display", false).GetInt("auto_off", 2)), 0,
                    kAutoOffCount - 1);
 
     settings_index_ = 0;
@@ -1607,6 +1747,9 @@ void LcdDisplay::SetScreenOn(bool on) {
     }
     screen_on_ = on;
     ResetIdleTimer();
+    if (!on) {
+        screen_off_seconds_ = 0;
+    }
 
     if (!on) {
         // A pending reset must not survive the screen going dark: the next key
@@ -1628,14 +1771,12 @@ void LcdDisplay::SetScreenOn(bool on) {
         }
         backlight->RestoreBrightness();  // reloads the stored brightness
     } else {
-        RefreshAod();
-        lv_obj_remove_flag(aod_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(aod_);
-        // Dim without touching the stored value, so waking up restores exactly
-        // the level the user chose.
-        backlight->SetBrightness(kAodBrightness);
+        // Real screen-off: kill the backlight so the panel draws no current.
+        // The always-on clock (AOD) is intentionally not shown, as keeping it
+        // lit would waste power; the board drops to deep sleep shortly after.
+        backlight->SetBrightness(0);
     }
-    ESP_LOGI(TAG, "Screen %s", on ? "on" : "off (clock)");
+    ESP_LOGI(TAG, "Screen %s", on ? "on" : "off (backlight off)");
 }
 
 void LcdDisplay::RefreshAod() {
@@ -1934,9 +2075,21 @@ void LcdDisplay::SetTheme(Theme* theme) {
         for (uint32_t i = 0; i < count; i++) {
             lv_obj_t* message = lv_obj_get_child(bottom_bar_, i);
             const char* role = static_cast<const char*>(lv_obj_get_user_data(message));
+            if (role != nullptr && strcmp(role, "divider") == 0) {
+                continue;  // separator rule has no text to recolour
+            }
             bool is_user = role != nullptr && strcmp(role, "user") == 0;
-            lv_obj_set_style_text_color(
-                message, is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color(), 0);
+            lv_color_t color =
+                is_user ? lvgl_theme->user_bubble_color() : lvgl_theme->text_color();
+            if (lv_obj_get_child_cnt(message) > 0) {
+                // Multi-paragraph container: recolour each paragraph label.
+                uint32_t sub_count = lv_obj_get_child_cnt(message);
+                for (uint32_t j = 0; j < sub_count; j++) {
+                    lv_obj_set_style_text_color(lv_obj_get_child(message, j), color, 0);
+                }
+            } else {
+                lv_obj_set_style_text_color(message, color, 0);
+            }
         }
     }
 

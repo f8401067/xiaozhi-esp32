@@ -47,6 +47,7 @@ protected:
     int volume_pct_ = 0;                       // mirror of the codec volume
     bool chat_reviewing_ = false;              // transcript scrolled off the end
     bool screen_on_ = true;
+    int screen_off_seconds_ = 0;                   // seconds since the screen went off (toward deep sleep)
 
     // --- Auto screen-off and the always-on clock ----------------------------
     lv_obj_t* aod_ = nullptr;               // dim clock overlay, built on first use
@@ -55,7 +56,7 @@ protected:
     lv_obj_t* aod_battery_ = nullptr;       // mirrors the top bar's percentage
     lv_timer_t* idle_timer_ = nullptr;      // ticks once a second
     int idle_seconds_ = 0;                  // seconds since the last user activity
-    int auto_off_index_ = 0;                // index into the auto-off delay table
+    int auto_off_index_ = 2;                // index into the auto-off delay table (default 3 min)
 
     void RefreshSettingsRows();
     void RefreshSettingsSelection();

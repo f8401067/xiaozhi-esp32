@@ -829,8 +829,12 @@ elseif(CONFIG_BOARD_TYPE_SURFER_C3_1_14TFT)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_32)
 elseif(CONFIG_BOARD_TYPE_FOLOTOY_AI_PASSPORT)
     set(BOARD_DIR "folotoy/ai-passport")
-    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
-    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
+    # One step down from 20 px: the Passport's 240 x 320 panel and the single
+    # merged top bar leave too little room for 20 px CJK text (7 characters
+    # across the centre slot at best). This also sizes the default assets font,
+    # so both the flashed app and the assets partition must be updated.
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_16_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_32)
 elseif(CONFIG_BOARD_TYPE_YUNLIAO_S3)
     set(BOARD_DIR "yunliao-s3")

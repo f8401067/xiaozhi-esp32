@@ -8,6 +8,7 @@
 #include "cw2017_battery_monitor.h"
 
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <esp_lcd_panel_vendor.h>
 #include <button_adc.h>
 #include <esp_adc/adc_oneshot.h>
@@ -119,6 +120,18 @@ private:
         }
     }
 
+    // OK double-click turns the screen off immediately. If it is already off,
+    // the press only wakes it (KeyHandledByWake). After that the normal idle
+    // timer keeps counting and drops to deep sleep 10 minutes later.
+    void OnKeyOkDoubleClick() {
+        if (KeyHandledByWake()) {
+            return;
+        }
+        if (display_ != nullptr) {
+            display_->SetScreenOn(false);
+        }
+    }
+
     void ToggleChat() {
         auto& app = Application::GetInstance();
         if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -184,6 +197,9 @@ private:
         });
         ok->OnLongPress([this]() {
             Application::GetInstance().Schedule([this]() { OnKeyOkLongPress(); });
+        });
+        ok->OnDoubleClick([this]() {
+            Application::GetInstance().Schedule([this]() { OnKeyOkDoubleClick(); });
         });
     }
 
@@ -289,6 +305,8 @@ public:
         return &audio_codec;
     }
 
+    void EnterDeepSleep() override;
+
     virtual Display* GetDisplay() override {
         return display_;
     }
@@ -314,5 +332,27 @@ public:
         return true;
     }
 };
+
+void AiPassportBoard::EnterDeepSleep() {
+    // Only drop to deep sleep when the device is genuinely idle: no open audio
+    // channel and the state machine is Idle. Otherwise stay awake and let the
+    // screen-off timer retry later.
+    if (!Application::GetInstance().CanEnterSleepMode()) {
+        return;
+    }
+
+    auto* backlight = GetBacklight();
+    if (backlight != nullptr) {
+        backlight->SetBrightness(0);
+    }
+
+    // The three ADC ladder keys (UP/DOWN/OK) share GPIO0 through a resistor
+    // ladder; any press pulls GPIO0 low, so a low level wakes the chip.
+    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+    ESP_ERROR_CHECK(gpio_wakeup_enable(GPIO_NUM_0, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    ESP_LOGI(TAG, "Entering deep sleep, wake on key (GPIO0 low)");
+    esp_deep_sleep_start();
+}
 
 DECLARE_BOARD(AiPassportBoard);

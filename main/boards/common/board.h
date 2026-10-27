@@ -80,6 +80,10 @@ public:
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetSystemInfoJson();
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
+    // Called when the display has been idle (screen off) long enough that the
+    // board should drop into deep sleep. Default does nothing; boards with a
+    // wake source override this to configure it and call esp_deep_sleep_start().
+    virtual void EnterDeepSleep() {}
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
 };
